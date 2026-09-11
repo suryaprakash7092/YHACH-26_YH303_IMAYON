@@ -1,478 +1,326 @@
+#define ENABLE_DATABASE
+
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <RTClib.h>
-#include <WiFi.h>
-#include <time.h>
 
-// ===============================
-// OLED - 1.3" SH1106 128x64
-// ===============================
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <FirebaseClient.h>
+
+// =====================================================
+// WIFI + FIREBASE
+// =====================================================
+
+#define WIFI_SSID     "arun's A16"
+#define WIFI_PASSWORD "123456@@"
+
+#define DATABASE_URL "https://doseguard-e7f16-default-rtdb.firebaseio.com"
+
+// =====================================================
+// THINGSPEAK
+// =====================================================
+
+#define THINGSPEAK_API_KEY "2ML3GWU1U58IRRKX"
+
+const char* THINGSPEAK_HOST = "api.thingspeak.com";
+
+WiFiClient thingSpeakClient;
+
+
+// =====================================================
+// FIREBASE OBJECTS
+// =====================================================
+
+FirebaseApp app;
+
+WiFiClientSecure ssl_client;
+
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client);
+
+RealtimeDatabase Database;
+
+
+// =====================================================
+// OLED - SH1106 1.3" 128x64
+// =====================================================
+
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(
   U8G2_R0,
   U8X8_PIN_NONE,
-  22,   // SCL
-  21    // SDA
+  22,
+  21
 );
 
-// ===============================
+
+// =====================================================
 // RTC
-// ===============================
+// =====================================================
+
 RTC_DS3231 rtc;
 
-// ===============================
-// WIFI
-// ===============================
-const char* WIFI_SSID = "arun's A16";
-const char* WIFI_PASSWORD = "123456@@";
 
-// India Standard Time
-const long GMT_OFFSET_SEC = 19800;
-const int DAYLIGHT_OFFSET_SEC = 0;
-
-// ===============================
+// =====================================================
 // PINS
-// ===============================
+// =====================================================
+
 #define MC38_PIN     32
 #define BUZZER_PIN   25
 #define LED_PIN      26
 
-// ===============================
-// DOSE TIMES
-// ===============================
-const int MORNING_HOUR   = 8;
-const int MORNING_MINUTE = 0;
 
-const int AFTERNOON_HOUR   = 13;
-const int AFTERNOON_MINUTE = 0;
+// =====================================================
+// DOSE SETTINGS
+// =====================================================
 
-const int NIGHT_HOUR   = 21;
-const int NIGHT_MINUTE = 35;
+// Morning
+int morningHour = 8;
+int morningMinute = 0;
 
-// ===============================
-// SETTINGS
-// ===============================
+// Afternoon
+int afternoonHour = 13;
+int afternoonMinute = 0;
 
-// TEST: 2 minutes
-// Later change 2 to 5, 10, 30 etc.
+// Night
+int nightHour = 3;
+int nightMinute = 10;
+
+
+// =====================================================
+// TIMING
+// =====================================================
+
+// Maximum time allowed for taking medicine
 const unsigned long DOSE_WINDOW =
-  2UL * 60UL * 1000UL;
+  30UL * 60UL * 1000UL;
 
-// Buzzer duration
+// Initial buzzer duration
 const unsigned long BUZZER_TIME =
   10UL * 1000UL;
 
-// ===============================
-// VARIABLES
-// ===============================
+// Patient reminder after 5 minutes
+const unsigned long PATIENT_REMINDER_TIME =
+  5UL * 60UL * 1000UL;
+
+// Caretaker alert after 10 minutes
+const unsigned long CARETAKER_ALERT_TIME =
+  10UL * 60UL * 1000UL;
+
+// ThingSpeak minimum update interval
+const unsigned long THINGSPEAK_INTERVAL =
+  15UL * 1000UL;
+
+
+// =====================================================
+// SYSTEM VARIABLES
+// =====================================================
+
+bool firebaseReady = false;
+
 bool doseActive = false;
-bool doseAccessed = false;
+bool doseHandled = false;
 bool doseMissed = false;
 
-unsigned long doseStartTime = 0;
-unsigned long buzzerStartTime = 0;
+// New alert flags
+bool patientReminderSent = false;
+bool caretakerAlertSent = false;
 
-int activeDoseHour = -1;
-int activeDoseMinute = -1;
+int activeDose = -1;
 
-String activeDoseName = "";
+unsigned long doseStartMillis = 0;
+unsigned long buzzerStartMillis = 0;
 
-int lastProcessedMinute = -1;
 
-bool timeSynced = false;
+// =====================================================
+// THINGSPEAK VARIABLES
+// =====================================================
 
-// ===============================
-// SETUP
-// ===============================
-void setup() {
+// Number of times medicine compartment was accessed
+unsigned long accessCount = 0;
 
-  Serial.begin(115200);
+// ThingSpeak dose status
+// 0 = IDLE
+// 1 = WAITING
+// 2 = ACCESSED
+// 3 = MISSED
 
-  // I2C
-  Wire.begin(21, 22);
+int thingSpeakDoseStatus = 0;
 
-  // Pins
-  pinMode(MC38_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
+// Last ThingSpeak upload
+unsigned long lastThingSpeakUpload = 0;
 
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(LED_PIN, LOW);
 
-  // OLED
-  u8g2.begin();
+// =====================================================
+// PREVENT REPEATED FIREBASE EVENTS
+// =====================================================
 
-  showStartingScreen();
+int lastFirebaseMinute = -1;
+int lastFirebaseDay = -1;
 
-  // RTC
-  if (!rtc.begin()) {
 
-    showMessage(
-      "RTC ERROR",
-      "Check DS3231"
-    );
+// =====================================================
+// DOSE NAMES
+// =====================================================
 
-    Serial.println("RTC NOT FOUND!");
+String getDoseName(int dose)
+{
+  if (dose == 0)
+    return "Morning Medicine";
 
-    while (1);
-  }
+  if (dose == 1)
+    return "Afternoon Medicine";
 
-  Serial.println("RTC OK");
+  if (dose == 2)
+    return "Night Medicine";
 
-  // ===============================
-  // CONNECT WIFI
-  // ===============================
-  connectWiFi();
-
-  // ===============================
-  // GET INTERNET TIME
-  // ===============================
-  if (WiFi.status() == WL_CONNECTED) {
-
-    syncRTCFromNTP();
-  }
-
-  showReadyScreen();
-
-  Serial.println("======================");
-  Serial.println("DOSEGUARD AI READY");
-  Serial.println("======================");
+  return "Unknown";
 }
 
-// ===============================
-// MAIN LOOP
-// ===============================
-void loop() {
 
-  // Keep Wi-Fi connected
-  if (WiFi.status() != WL_CONNECTED) {
+// =====================================================
+// DOSE TIME
+// =====================================================
 
-    Serial.println("WiFi disconnected.");
+String getDoseTime(int dose)
+{
+  char buffer[10];
 
-    connectWiFi();
+  int hour = 0;
+  int minute = 0;
+
+  if (dose == 0)
+  {
+    hour = morningHour;
+    minute = morningMinute;
+  }
+  else if (dose == 1)
+  {
+    hour = afternoonHour;
+    minute = afternoonMinute;
+  }
+  else if (dose == 2)
+  {
+    hour = nightHour;
+    minute = nightMinute;
   }
 
-  // Get RTC time
-  DateTime now = rtc.now();
+  sprintf(
+    buffer,
+    "%02d:%02d",
+    hour,
+    minute
+  );
 
-  int currentHour = now.hour();
-  int currentMinute = now.minute();
-
-  // ===============================
-  // CHECK NEW DOSE
-  // ===============================
-  if (currentMinute != lastProcessedMinute) {
-
-    lastProcessedMinute = currentMinute;
-
-    checkDoseSchedule(
-      currentHour,
-      currentMinute
-    );
-  }
-
-  // ===============================
-  // ACTIVE DOSE
-  // ===============================
-  if (doseActive) {
-
-    bool compartmentOpen =
-      isCompartmentOpen();
-
-    // ===============================
-    // DOSE ACCESSED
-    // ===============================
-    if (compartmentOpen && !doseAccessed) {
-
-      doseAccessed = true;
-      doseActive = false;
-
-      digitalWrite(BUZZER_PIN, LOW);
-      digitalWrite(LED_PIN, LOW);
-
-      showAccessedScreen();
-
-      Serial.println("DOSE ACCESSED");
-
-      delay(3000);
-    }
-
-    // ===============================
-    // STOP BUZZER
-    // ===============================
-    if (millis() - buzzerStartTime >=
-        BUZZER_TIME) {
-
-      digitalWrite(BUZZER_PIN, LOW);
-      digitalWrite(LED_PIN, LOW);
-    }
-
-    // ===============================
-    // MISSED DOSE
-    // ===============================
-    if (!doseAccessed &&
-        millis() - doseStartTime >=
-        DOSE_WINDOW) {
-
-      doseActive = false;
-      doseMissed = true;
-
-      digitalWrite(BUZZER_PIN, LOW);
-      digitalWrite(LED_PIN, LOW);
-
-      showMissedScreen();
-
-      Serial.println("======================");
-      Serial.println("MISSED DOSE");
-      Serial.println("Caretaker alert needed");
-      Serial.println("======================");
-
-      delay(3000);
-    }
-  }
-
-  // ===============================
-  // NORMAL SCREEN
-  // ===============================
-  if (!doseActive &&
-      !doseMissed &&
-      !doseAccessed) {
-
-    showMainScreen(now);
-  }
-
-  delay(200);
+  return String(buffer);
 }
 
-// ===============================
-// WIFI CONNECTION
-// ===============================
-void connectWiFi() {
 
-  Serial.println();
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+// =====================================================
+// DOSE NUMBER FOR THINGSPEAK
+// =====================================================
 
+int getDoseNumber()
+{
+  if (activeDose == 0)
+    return 1;
+
+  if (activeDose == 1)
+    return 2;
+
+  if (activeDose == 2)
+    return 3;
+
+  return 0;
+}
+
+
+// =====================================================
+// DOSE SCHEDULE CHECK
+// =====================================================
+
+int getCurrentDose(DateTime now)
+{
+  int currentMinutes =
+    now.hour() * 60 + now.minute();
+
+  int morning =
+    morningHour * 60 + morningMinute;
+
+  int afternoon =
+    afternoonHour * 60 + afternoonMinute;
+
+  int night =
+    nightHour * 60 + nightMinute;
+
+
+  if (currentMinutes == morning)
+    return 0;
+
+  if (currentMinutes == afternoon)
+    return 1;
+
+  if (currentMinutes == night)
+    return 2;
+
+  return -1;
+}
+
+
+// =====================================================
+// OLED MESSAGE
+// =====================================================
+
+void showMessage(
+  String line1,
+  String line2 = "",
+  String line3 = ""
+)
+{
   u8g2.clearBuffer();
 
-  u8g2.setFont(u8g2_font_ncenB12_tr);
-  u8g2.drawStr(20, 20, "WiFi");
+  u8g2.setFont(
+    u8g2_font_6x12_tf
+  );
 
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(15, 40, "CONNECTING...");
+  u8g2.drawStr(
+    0,
+    14,
+    line1.c_str()
+  );
+
+  if (line2 != "")
+  {
+    u8g2.drawStr(
+      0,
+      32,
+      line2.c_str()
+    );
+  }
+
+  if (line3 != "")
+  {
+    u8g2.drawStr(
+      0,
+      50,
+      line3.c_str()
+    );
+  }
 
   u8g2.sendBuffer();
-
-  WiFi.begin(
-    WIFI_SSID,
-    WIFI_PASSWORD
-  );
-
-  int attempts = 0;
-
-  while (WiFi.status() != WL_CONNECTED &&
-         attempts < 20) {
-
-    delay(500);
-
-    Serial.print(".");
-
-    attempts++;
-  }
-
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-
-    Serial.println("WiFi CONNECTED!");
-
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-
-    showMessage(
-      "WiFi CONNECTED",
-      "IP READY"
-    );
-
-    delay(1500);
-  }
-
-  else {
-
-    Serial.println("WiFi FAILED");
-
-    showMessage(
-      "WiFi OFFLINE",
-      "RTC ACTIVE"
-    );
-
-    delay(1500);
-  }
 }
 
-// ===============================
-// NTP → RTC
-// ===============================
-void syncRTCFromNTP() {
 
-  Serial.println("Getting NTP time...");
-
-  configTime(
-    GMT_OFFSET_SEC,
-    DAYLIGHT_OFFSET_SEC,
-    "pool.ntp.org",
-    "time.nist.gov"
-  );
-
-  struct tm timeinfo;
-
-  if (!getLocalTime(
-        &timeinfo,
-        10000)) {
-
-    Serial.println(
-      "NTP TIME FAILED"
-    );
-
-    timeSynced = false;
-
-    return;
-  }
-
-  // Convert NTP time to DateTime
-  DateTime ntpTime(
-    timeinfo.tm_year + 1900,
-    timeinfo.tm_mon + 1,
-    timeinfo.tm_mday,
-    timeinfo.tm_hour,
-    timeinfo.tm_min,
-    timeinfo.tm_sec
-  );
-
-  // Set DS3231
-  rtc.adjust(ntpTime);
-
-  timeSynced = true;
-
-  Serial.println(
-    "RTC synchronized from NTP!"
-  );
-
-  Serial.print("Date: ");
-  Serial.print(ntpTime.day());
-  Serial.print("/");
-  Serial.print(ntpTime.month());
-  Serial.print("/");
-  Serial.println(ntpTime.year());
-
-  Serial.print("Time: ");
-  Serial.print(ntpTime.hour());
-  Serial.print(":");
-  Serial.print(ntpTime.minute());
-  Serial.print(":");
-  Serial.println(ntpTime.second());
-}
-
-// ===============================
-// DOSE SCHEDULE
-// ===============================
-void checkDoseSchedule(
-  int hour,
-  int minute
-) {
-
-  if (hour == MORNING_HOUR &&
-      minute == MORNING_MINUTE) {
-
-    startDose(
-      MORNING_HOUR,
-      MORNING_MINUTE,
-      "MORNING"
-    );
-  }
-
-  else if (
-    hour == AFTERNOON_HOUR &&
-    minute == AFTERNOON_MINUTE
-  ) {
-
-    startDose(
-      AFTERNOON_HOUR,
-      AFTERNOON_MINUTE,
-      "AFTERNOON"
-    );
-  }
-
-  else if (
-    hour == NIGHT_HOUR &&
-    minute == NIGHT_MINUTE
-  ) {
-
-    startDose(
-      NIGHT_HOUR,
-      NIGHT_MINUTE,
-      "NIGHT"
-    );
-  }
-}
-
-// ===============================
-// START DOSE
-// ===============================
-void startDose(
-  int hour,
-  int minute,
-  String name
-) {
-
-  doseActive = true;
-  doseAccessed = false;
-  doseMissed = false;
-
-  activeDoseHour = hour;
-  activeDoseMinute = minute;
-  activeDoseName = name;
-
-  doseStartTime = millis();
-  buzzerStartTime = millis();
-
-  digitalWrite(
-    BUZZER_PIN,
-    HIGH
-  );
-
-  digitalWrite(
-    LED_PIN,
-    HIGH
-  );
-
-  showReminderScreen();
-
-  Serial.println();
-  Serial.println("======================");
-  Serial.print("DOSE REMINDER: ");
-  Serial.println(name);
-  Serial.println("======================");
-}
-
-// ===============================
-// MC-38
-// ===============================
-bool isCompartmentOpen() {
-
-  // LOW  = CLOSED
-  // HIGH = OPEN
-
-  return digitalRead(MC38_PIN) == HIGH;
-}
-
-// ===============================
+// =====================================================
 // MAIN SCREEN
-// ===============================
-void showMainScreen(
-  DateTime now
-) {
+// =====================================================
 
-  char timeBuffer[10];
+void showMainScreen(DateTime now)
+{
+  bool compartmentOpen =
+    digitalRead(MC38_PIN) == HIGH;
+
+  char timeBuffer[20];
 
   sprintf(
     timeBuffer,
@@ -485,312 +333,1500 @@ void showMainScreen(
   u8g2.clearBuffer();
 
   u8g2.setFont(
-    u8g2_font_ncenB12_tr
+    u8g2_font_6x12_tf
   );
 
   u8g2.drawStr(
-    5,
-    15,
+    0,
+    12,
     "DOSEGUARD AI"
   );
 
-  u8g2.setFont(
-    u8g2_font_ncenB14_tr
-  );
-
   u8g2.drawStr(
-    25,
-    38,
+    0,
+    28,
     timeBuffer
   );
 
-  u8g2.setFont(
-    u8g2_font_6x10_tf
-  );
-
-  if (isCompartmentOpen()) {
-
+  if (compartmentOpen)
+  {
     u8g2.drawStr(
-      5,
-      53,
-      "COMPARTMENT: OPEN"
+      0,
+      44,
+      "COMPARTMENT OPEN"
+    );
+  }
+  else
+  {
+    u8g2.drawStr(
+      0,
+      44,
+      "COMPARTMENT CLOSED"
     );
   }
 
-  else {
-
+  if (WiFi.status() == WL_CONNECTED)
+  {
     u8g2.drawStr(
-      5,
-      53,
-      "COMPARTMENT: CLOSED"
+      0,
+      60,
+      "WiFi: ONLINE"
     );
   }
-
-  // WiFi status
-  if (WiFi.status() ==
-      WL_CONNECTED) {
-
+  else
+  {
     u8g2.drawStr(
-      105,
-      63,
-      "W"
-    );
-  }
-
-  else {
-
-    u8g2.drawStr(
-      105,
-      63,
-      "-"
+      0,
+      60,
+      "WiFi: OFFLINE"
     );
   }
 
   u8g2.sendBuffer();
 }
 
-// ===============================
-// REMINDER SCREEN
-// ===============================
-void showReminderScreen() {
 
-  u8g2.clearBuffer();
+// =====================================================
+// FIREBASE SET STRING
+// =====================================================
 
-  u8g2.setFont(
-    u8g2_font_ncenB12_tr
+void firebaseSetString(
+  String path,
+  String value
+)
+{
+  if (!app.ready())
+    return;
+
+  Database.set<String>(
+    aClient,
+    path,
+    value
   );
-
-  u8g2.drawStr(
-    15,
-    14,
-    "MEDICINE TIME"
-  );
-
-  u8g2.setFont(
-    u8g2_font_ncenB14_tr
-  );
-
-  char doseTime[10];
-
-  sprintf(
-    doseTime,
-    "%02d:%02d",
-    activeDoseHour,
-    activeDoseMinute
-  );
-
-  u8g2.drawStr(
-    38,
-    34,
-    doseTime
-  );
-
-  u8g2.setFont(
-    u8g2_font_6x10_tf
-  );
-
-  u8g2.drawStr(
-    15,
-    48,
-    "OPEN COMPARTMENT"
-  );
-
-  u8g2.drawStr(
-    25,
-    60,
-    "WAITING..."
-  );
-
-  u8g2.sendBuffer();
 }
 
-// ===============================
-// ACCESSED SCREEN
-// ===============================
-void showAccessedScreen() {
 
-  u8g2.clearBuffer();
+// =====================================================
+// SEND DEVICE STATUS
+// =====================================================
 
-  u8g2.setFont(
-    u8g2_font_ncenB12_tr
+void sendDeviceStatus()
+{
+  if (!app.ready())
+    return;
+
+  firebaseSetString(
+    "/DoseGuard/device/status",
+    "ONLINE"
   );
 
-  u8g2.drawStr(
-    20,
-    18,
-    "DOSE ACCESS"
+  String compartment;
+
+  if (
+    digitalRead(MC38_PIN) == HIGH
+  )
+  {
+    compartment = "OPEN";
+  }
+  else
+  {
+    compartment = "CLOSED";
+  }
+
+  firebaseSetString(
+    "/DoseGuard/device/compartment",
+    compartment
   );
 
-  u8g2.setFont(
-    u8g2_font_ncenB14_tr
+  firebaseSetString(
+    "/DoseGuard/device/wifi",
+    "CONNECTED"
+  );
+}
+
+
+// =====================================================
+// SEND CURRENT DOSE
+// =====================================================
+
+void sendCurrentDose(
+  int dose,
+  String status
+)
+{
+  if (!app.ready())
+    return;
+
+  String doseName =
+    getDoseName(dose);
+
+  String scheduledTime =
+    getDoseTime(dose);
+
+
+  firebaseSetString(
+    "/DoseGuard/currentDose/name",
+    doseName
   );
 
-  u8g2.drawStr(
-    45,
-    38,
-    "OK"
+  firebaseSetString(
+    "/DoseGuard/currentDose/scheduledTime",
+    scheduledTime
   );
 
-  u8g2.setFont(
-    u8g2_font_6x10_tf
+  firebaseSetString(
+    "/DoseGuard/currentDose/status",
+    status
+  );
+}
+
+
+// =====================================================
+// SEND HISTORY EVENT
+// =====================================================
+
+void sendHistoryEvent(
+  DateTime now,
+  String doseName,
+  String status
+)
+{
+  if (!app.ready())
+    return;
+
+  String dateTime =
+    String(now.year()) + "-" +
+    String(now.month()) + "-" +
+    String(now.day()) + " " +
+    String(now.hour()) + ":" +
+    String(now.minute()) + ":" +
+    String(now.second());
+
+
+  String eventData =
+    "Dose=" + doseName +
+    " | Time=" + dateTime +
+    " | Status=" + status;
+
+
+  Database.push<String>(
+    aClient,
+    "/DoseGuard/history",
+    eventData
+  );
+}
+
+
+// =====================================================
+// SEND CARETAKER ALERT TO FIREBASE
+// =====================================================
+
+void sendCaretakerAlert(DateTime now)
+{
+  if (!app.ready())
+  {
+    Serial.println(
+      "Firebase not ready - caretaker alert not sent"
+    );
+
+    return;
+  }
+
+
+  String doseName =
+    getDoseName(activeDose);
+
+  String scheduledTime =
+    getDoseTime(activeDose);
+
+
+  String alertTime =
+    String(now.year()) + "-" +
+    String(now.month()) + "-" +
+    String(now.day()) + " " +
+    String(now.hour()) + ":" +
+    String(now.minute()) + ":" +
+    String(now.second());
+
+
+  Serial.println();
+  Serial.println(
+    "================================"
   );
 
-  u8g2.drawStr(
-    15,
-    50,
-    "COMPARTMENT OPENED"
+  Serial.println(
+    "CARETAKER ALERT"
   );
 
-  u8g2.drawStr(
-    20,
-    62,
+  Serial.println(
+    doseName
+  );
+
+  Serial.println(
+    "Medicine NOT taken"
+  );
+
+  Serial.println(
+    "Sending alert to Firebase..."
+  );
+
+
+  // ---------------------------------------------------
+  // Main alert information
+  // ---------------------------------------------------
+
+  firebaseSetString(
+    "/DoseGuard/alerts/type",
+    "CARETAKER_ALERT"
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/dose",
+    doseName
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/scheduledTime",
+    scheduledTime
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/status",
+    "NOT_TAKEN"
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/message",
+    "Patient has not taken the scheduled medicine"
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/timestamp",
+    alertTime
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/emailRequired",
+    "true"
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/caretakerAlert",
+    "true"
+  );
+
+
+  // ---------------------------------------------------
+  // Additional useful information
+  // ---------------------------------------------------
+
+  firebaseSetString(
+    "/DoseGuard/alerts/doseNumber",
+    String(getDoseNumber())
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/alertLevel",
+    "HIGH"
+  );
+
+  firebaseSetString(
+    "/DoseGuard/alerts/device",
+    "DOSEGUARD AI"
+  );
+
+
+  // ---------------------------------------------------
+  // History
+  // ---------------------------------------------------
+
+  sendHistoryEvent(
+    now,
+    doseName,
+    "CARETAKER ALERT - NOT TAKEN"
+  );
+
+
+  Serial.println(
+    "Caretaker alert stored in Firebase"
+  );
+
+  Serial.println(
+    "================================"
+  );
+}
+
+
+// =====================================================
+// THINGSPEAK UPLOAD
+// =====================================================
+
+void sendThingSpeakData()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println(
+      "ThingSpeak: WiFi not connected"
+    );
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // MC-38 STATUS
+  // ---------------------------------------------------
+
+  int mc38Status = 0;
+
+  if (
+    digitalRead(MC38_PIN) == HIGH
+  )
+  {
+    mc38Status = 1;
+  }
+  else
+  {
+    mc38Status = 0;
+  }
+
+
+  // ---------------------------------------------------
+  // DOSE NUMBER
+  // ---------------------------------------------------
+
+  int doseNumber =
+    getDoseNumber();
+
+
+  // ---------------------------------------------------
+  // MISSED DOSE
+  // ---------------------------------------------------
+
+  int missed =
+    doseMissed ? 1 : 0;
+
+
+  // ---------------------------------------------------
+  // WIFI RSSI
+  // ---------------------------------------------------
+
+  int rssi =
+    WiFi.RSSI();
+
+
+  // ---------------------------------------------------
+  // CONNECT THINGSPEAK
+  // ---------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "Uploading to ThingSpeak..."
+  );
+
+
+  if (
+    !thingSpeakClient.connect(
+      THINGSPEAK_HOST,
+      80
+    )
+  )
+  {
+    Serial.println(
+      "ThingSpeak connection failed"
+    );
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // BUILD REQUEST
+  // ---------------------------------------------------
+
+  String url =
+    "/update?api_key=" +
+    String(THINGSPEAK_API_KEY) +
+
+    "&field1=" +
+    String(mc38Status) +
+
+    "&field2=" +
+    String(thingSpeakDoseStatus) +
+
+    "&field3=" +
+    String(doseNumber) +
+
+    "&field4=" +
+    String(missed) +
+
+    "&field5=" +
+    String(accessCount) +
+
+    "&field6=" +
+    String(rssi);
+
+
+  // ---------------------------------------------------
+  // HTTP GET
+  // ---------------------------------------------------
+
+  thingSpeakClient.print(
+    String("GET ") +
+    url +
+    " HTTP/1.1\r\n" +
+
+    "Host: " +
+    THINGSPEAK_HOST +
+    "\r\n" +
+
+    "Connection: close\r\n\r\n"
+  );
+
+
+  // ---------------------------------------------------
+  // READ RESPONSE
+  // ---------------------------------------------------
+
+  unsigned long timeout =
+    millis();
+
+  while (
+    thingSpeakClient.available() == 0
+  )
+  {
+    if (
+      millis() - timeout > 5000
+    )
+    {
+      Serial.println(
+        "ThingSpeak timeout"
+      );
+
+      thingSpeakClient.stop();
+
+      return;
+    }
+
+    delay(10);
+  }
+
+
+  String response =
+    thingSpeakClient.readString();
+
+  thingSpeakClient.stop();
+
+
+  Serial.println(
+    "ThingSpeak response:"
+  );
+
+  Serial.println(response);
+
+
+  // ---------------------------------------------------
+  // SUCCESS
+  // ---------------------------------------------------
+
+  if (
+    response.indexOf("200 OK") >= 0
+  )
+  {
+    Serial.println(
+      "ThingSpeak upload successful!"
+    );
+  }
+  else
+  {
+    Serial.println(
+      "ThingSpeak upload completed"
+    );
+  }
+
+
+  Serial.println(
+    "--------------------------------"
+  );
+
+  Serial.print(
+    "MC-38: "
+  );
+
+  Serial.println(
+    mc38Status
+  );
+
+  Serial.print(
+    "Dose Status: "
+  );
+
+  Serial.println(
+    thingSpeakDoseStatus
+  );
+
+  Serial.print(
+    "Dose Number: "
+  );
+
+  Serial.println(
+    doseNumber
+  );
+
+  Serial.print(
+    "Missed: "
+  );
+
+  Serial.println(
+    missed
+  );
+
+  Serial.print(
+    "Access Count: "
+  );
+
+  Serial.println(
+    accessCount
+  );
+
+  Serial.print(
+    "RSSI: "
+  );
+
+  Serial.println(
+    rssi
+  );
+}
+
+
+// =====================================================
+// DOSE ACCESSED
+// =====================================================
+
+void doseAccessed(DateTime now)
+{
+  if (doseHandled)
+    return;
+
+
+  doseHandled = true;
+  doseActive = false;
+
+
+  // Reset alert flags
+  patientReminderSent = false;
+  caretakerAlertSent = false;
+
+
+  // ThingSpeak status
+  thingSpeakDoseStatus = 2;
+
+
+  // Increase access count
+  accessCount++;
+
+
+  // Stop buzzer
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+
+  // Stop LED
+  digitalWrite(
+    LED_PIN,
+    LOW
+  );
+
+
+  String doseName =
+    getDoseName(activeDose);
+
+
+  showMessage(
+    "DOSE ACCESS",
+    "OK",
     "ACCESS RECORDED"
   );
 
-  u8g2.sendBuffer();
-}
 
-// ===============================
-// MISSED SCREEN
-// ===============================
-void showMissedScreen() {
-
-  u8g2.clearBuffer();
-
-  u8g2.setFont(
-    u8g2_font_ncenB12_tr
+  // Firebase current dose
+  sendCurrentDose(
+    activeDose,
+    "ACCESSED"
   );
 
-  u8g2.drawStr(
-    22,
-    18,
-    "MISSED DOSE"
+
+  // Firebase history
+  sendHistoryEvent(
+    now,
+    doseName,
+    "ACCESSED"
   );
 
-  u8g2.setFont(
-    u8g2_font_6x10_tf
+
+  Serial.println();
+  Serial.println(
+    "================================"
   );
 
-  u8g2.drawStr(
-    18,
-    38,
-    "NO ACCESS DETECTED"
+  Serial.println(
+    "DOSE ACCESSED"
   );
 
-  u8g2.drawStr(
-    20,
-    50,
-    "DOSE MARKED MISSED"
+  Serial.println(
+    doseName
   );
 
-  u8g2.drawStr(
-    25,
-    62,
-    "ALERT PENDING"
+  Serial.print(
+    "Access Count: "
   );
 
-  u8g2.sendBuffer();
-}
-
-// ===============================
-// READY SCREEN
-// ===============================
-void showReadyScreen() {
-
-  u8g2.clearBuffer();
-
-  u8g2.setFont(
-    u8g2_font_ncenB12_tr
+  Serial.println(
+    accessCount
   );
 
-  u8g2.drawStr(
-    25,
-    20,
-    "SYSTEM READY"
+  Serial.println(
+    "================================"
   );
 
-  u8g2.setFont(
-    u8g2_font_6x10_tf
-  );
 
-  u8g2.drawStr(
-    20,
-    40,
-    "MEDICINE MONITOR"
-  );
+  // ThingSpeak
+  sendThingSpeakData();
 
-  u8g2.drawStr(
-    20,
-    55,
-    "3 DAILY DOSES"
-  );
-
-  u8g2.sendBuffer();
 
   delay(2000);
 }
 
-// ===============================
-// STARTING SCREEN
-// ===============================
-void showStartingScreen() {
 
-  u8g2.clearBuffer();
+// =====================================================
+// MISSED DOSE
+// =====================================================
 
-  u8g2.setFont(
-    u8g2_font_ncenB14_tr
+void missedDose(DateTime now)
+{
+  if (doseMissed)
+    return;
+
+
+  doseMissed = true;
+  doseActive = false;
+
+
+  // ThingSpeak status
+  thingSpeakDoseStatus = 3;
+
+
+  // Stop buzzer
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
   );
 
-  u8g2.drawStr(
-    10,
-    25,
-    "DOSEGUARD"
+
+  // Stop LED
+  digitalWrite(
+    LED_PIN,
+    LOW
   );
 
-  u8g2.setFont(
-    u8g2_font_ncenB10_tr
+
+  String doseName =
+    getDoseName(activeDose);
+
+
+  showMessage(
+    "MISSED DOSE",
+    "NO ACCESS DETECTED",
+    "CHECK USER"
   );
 
-  u8g2.drawStr(
-    28,
-    48,
-    "AI SYSTEM"
+
+  // Firebase
+  sendCurrentDose(
+    activeDose,
+    "MISSED"
   );
 
-  u8g2.sendBuffer();
 
-  delay(1500);
+  // Firebase history
+  sendHistoryEvent(
+    now,
+    doseName,
+    "MISSED"
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "MISSED DOSE"
+  );
+
+  Serial.println(
+    doseName
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ThingSpeak
+  sendThingSpeakData();
+
+
+  delay(2000);
 }
 
-// ===============================
-// SIMPLE MESSAGE
-// ===============================
-void showMessage(
-  const char* line1,
-  const char* line2
-) {
 
-  u8g2.clearBuffer();
+// =====================================================
+// START DOSE
+// =====================================================
 
-  u8g2.setFont(
-    u8g2_font_ncenB12_tr
+void startDose(
+  int dose,
+  DateTime now
+)
+{
+  activeDose = dose;
+
+  doseActive = true;
+  doseHandled = false;
+  doseMissed = false;
+
+  // Reset alert flags for new dose
+  patientReminderSent = false;
+  caretakerAlertSent = false;
+
+
+  doseStartMillis =
+    millis();
+
+  buzzerStartMillis =
+    millis();
+
+
+  // ThingSpeak status
+  thingSpeakDoseStatus = 1;
+
+
+  // Turn buzzer ON
+  digitalWrite(
+    BUZZER_PIN,
+    HIGH
   );
 
-  u8g2.drawStr(
-    10,
-    25,
-    line1
+
+  // Turn LED ON
+  digitalWrite(
+    LED_PIN,
+    HIGH
   );
 
-  u8g2.setFont(
-    u8g2_font_6x10_tf
+
+  String doseName =
+    getDoseName(dose);
+
+
+  showMessage(
+    "MEDICINE TIME",
+    doseName,
+    "OPEN COMPARTMENT"
   );
 
-  u8g2.drawStr(
-    15,
-    48,
-    line2
+
+  // Firebase
+  sendCurrentDose(
+    dose,
+    "WAITING"
   );
 
-  u8g2.sendBuffer();
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "MEDICINE TIME"
+  );
+
+  Serial.println(
+    doseName
+  );
+
+  Serial.println(
+    "Patient has 30 minutes"
+  );
+
+  Serial.println(
+    "Caretaker alert after 10 minutes"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ThingSpeak
+  sendThingSpeakData();
+}
+
+
+// =====================================================
+// CHECK ACTIVE DOSE
+// =====================================================
+
+void checkDoseAccess(DateTime now)
+{
+  if (!doseActive)
+    return;
+
+
+  unsigned long elapsedTime =
+    millis() - doseStartMillis;
+
+
+  // ---------------------------------------------------
+  // CHECK COMPARTMENT
+  // ---------------------------------------------------
+
+  bool compartmentOpen =
+    digitalRead(MC38_PIN) == HIGH;
+
+
+  // ---------------------------------------------------
+  // USER OPENED COMPARTMENT
+  // ---------------------------------------------------
+
+  if (
+    compartmentOpen &&
+    !doseHandled
+  )
+  {
+    doseAccessed(now);
+
+    return;
+  }
+
+
+  // ---------------------------------------------------
+  // STOP INITIAL BUZZER AFTER 10 SECONDS
+  // ---------------------------------------------------
+
+  if (
+    millis() -
+    buzzerStartMillis >=
+    BUZZER_TIME
+  )
+  {
+    digitalWrite(
+      BUZZER_PIN,
+      LOW
+    );
+  }
+
+
+  // ---------------------------------------------------
+  // PATIENT REMINDER AFTER 5 MINUTES
+  // ---------------------------------------------------
+
+  if (
+    elapsedTime >=
+    PATIENT_REMINDER_TIME &&
+
+    !patientReminderSent
+  )
+  {
+    patientReminderSent = true;
+
+
+    String doseName =
+      getDoseName(activeDose);
+
+
+    Serial.println();
+    Serial.println(
+      "--------------------------------"
+    );
+
+    Serial.println(
+      "PATIENT REMINDER"
+    );
+
+    Serial.println(
+      "Medicine still not taken"
+    );
+
+    Serial.println(
+      doseName
+    );
+
+    Serial.println(
+      "--------------------------------"
+    );
+
+
+    // OLED
+    showMessage(
+      "REMINDER",
+      "TAKE MEDICINE",
+      doseName
+    );
+
+
+    // Short reminder buzzer
+    digitalWrite(
+      BUZZER_PIN,
+      HIGH
+    );
+
+    digitalWrite(
+      LED_PIN,
+      HIGH
+    );
+
+
+    buzzerStartMillis =
+      millis();
+
+
+    // Firebase
+    sendCurrentDose(
+      activeDose,
+      "REMINDER"
+    );
+
+
+    // History
+    sendHistoryEvent(
+      now,
+      doseName,
+      "PATIENT REMINDER"
+    );
+  }
+
+
+  // ---------------------------------------------------
+  // CARETAKER ALERT AFTER 10 MINUTES
+  // ---------------------------------------------------
+
+  if (
+    elapsedTime >=
+    CARETAKER_ALERT_TIME &&
+
+    !caretakerAlertSent
+  )
+  {
+    caretakerAlertSent = true;
+
+
+    Serial.println();
+    Serial.println(
+      "################################"
+    );
+
+    Serial.println(
+      "CARETAKER ALERT TRIGGERED"
+    );
+
+    Serial.println(
+      "Patient has NOT taken medicine"
+    );
+
+    Serial.println(
+      "Sending to Firebase..."
+    );
+
+    Serial.println(
+      "################################"
+    );
+
+
+    // Send caretaker alert
+    sendCaretakerAlert(now);
+
+
+    // Keep dose status WAITING
+    thingSpeakDoseStatus = 1;
+
+
+    // Upload to ThingSpeak
+    sendThingSpeakData();
+
+
+    // OLED
+    showMessage(
+      "CARETAKER ALERT",
+      "NOT TAKEN",
+      "ALERT SENT"
+    );
+  }
+
+
+  // ---------------------------------------------------
+  // MISSED AFTER 30 MINUTES
+  // ---------------------------------------------------
+
+  if (
+    elapsedTime >=
+    DOSE_WINDOW
+  )
+  {
+    missedDose(now);
+
+    return;
+  }
+}
+
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.println(
+    "Connecting to WiFi..."
+  );
+
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  )
+  {
+    Serial.print(".");
+    delay(500);
+  }
+
+
+  Serial.println();
+
+  Serial.println(
+    "WiFi connected!"
+  );
+
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+
+
+  Serial.print(
+    "RSSI: "
+  );
+
+  Serial.println(
+    WiFi.RSSI()
+  );
+}
+
+
+// =====================================================
+// FIREBASE INITIALIZATION
+// =====================================================
+
+void setupFirebase()
+{
+  Serial.println();
+  Serial.println(
+    "Connecting to Firebase..."
+  );
+
+
+  NoAuth no_auth;
+
+
+  initializeApp(
+    aClient,
+    app,
+    getAuth(no_auth)
+  );
+
+
+  app.getApp<RealtimeDatabase>(
+    Database
+  );
+
+
+  Database.url(
+    DATABASE_URL
+  );
+
+
+  firebaseReady = true;
+
+
+  Serial.println(
+    "Firebase initialized!"
+  );
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(
+    115200
+  );
+
+
+  delay(1000);
+
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "DOSEGUARD AI"
+  );
+
+  Serial.println(
+    "IoT Medication System"
+  );
+
+  Serial.println(
+    "Firebase + ThingSpeak"
+  );
+
+  Serial.println(
+    "Caretaker Alert System"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ---------------------------------------------------
+  // PINS
+  // ---------------------------------------------------
+
+  pinMode(
+    MC38_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    LED_PIN,
+    OUTPUT
+  );
+
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+
+  digitalWrite(
+    LED_PIN,
+    LOW
+  );
+
+
+  // ---------------------------------------------------
+  // OLED
+  // ---------------------------------------------------
+
+  u8g2.begin();
+
+
+  showMessage(
+    "DOSEGUARD AI",
+    "Starting..."
+  );
+
+
+  delay(1000);
+
+
+  // ---------------------------------------------------
+  // RTC
+  // ---------------------------------------------------
+
+  if (!rtc.begin())
+  {
+    Serial.println(
+      "RTC NOT FOUND!"
+    );
+
+
+    showMessage(
+      "RTC ERROR",
+      "Check DS3231"
+    );
+
+
+    while (1)
+    {
+      delay(100);
+    }
+  }
+
+
+  Serial.println(
+    "RTC OK"
+  );
+
+
+  // ---------------------------------------------------
+  // WIFI
+  // ---------------------------------------------------
+
+  connectWiFi();
+
+
+  // ---------------------------------------------------
+  // FIREBASE
+  // ---------------------------------------------------
+
+  ssl_client.setInsecure();
+
+
+  setupFirebase();
+
+
+  // ---------------------------------------------------
+  // INITIAL THINGSPEAK STATUS
+  // ---------------------------------------------------
+
+  thingSpeakDoseStatus = 0;
+
+
+  // ---------------------------------------------------
+  // INITIAL THINGSPEAK UPLOAD
+  // ---------------------------------------------------
+
+  delay(2000);
+
+  sendThingSpeakData();
+
+
+  lastThingSpeakUpload =
+    millis();
+
+
+  // ---------------------------------------------------
+  // INITIAL SCREEN
+  // ---------------------------------------------------
+
+  showMessage(
+    "SYSTEM READY",
+    "Cloud Connected",
+    "Firebase + ThingSpeak"
+  );
+
+
+  delay(2000);
+
+
+  Serial.println(
+    "SYSTEM READY"
+  );
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // FIREBASE BACKGROUND PROCESSING
+  // ---------------------------------------------------
+
+  app.loop();
+
+
+  // ---------------------------------------------------
+  // GET RTC TIME
+  // ---------------------------------------------------
+
+  DateTime now =
+    rtc.now();
+
+
+  // ---------------------------------------------------
+  // FIREBASE DEVICE STATUS
+  // EVERY 10 SECONDS
+  // ---------------------------------------------------
+
+  static unsigned long lastStatusUpload = 0;
+
+
+  if (
+    app.ready() &&
+    millis() -
+    lastStatusUpload >=
+    10000
+  )
+  {
+    lastStatusUpload =
+      millis();
+
+
+    sendDeviceStatus();
+
+
+    Serial.println(
+      "Firebase status updated"
+    );
+  }
+
+
+  // ---------------------------------------------------
+  // THINGSPEAK
+  // EVERY 15 SECONDS
+  // ---------------------------------------------------
+
+  if (
+    millis() -
+    lastThingSpeakUpload >=
+    THINGSPEAK_INTERVAL
+  )
+  {
+    lastThingSpeakUpload =
+      millis();
+
+
+    sendThingSpeakData();
+  }
+
+
+  // ---------------------------------------------------
+  // CHECK DOSE SCHEDULE
+  // ---------------------------------------------------
+
+  int scheduledDose =
+    getCurrentDose(now);
+
+
+  // ---------------------------------------------------
+  // START NEW DOSE
+  // ---------------------------------------------------
+
+  if (
+    scheduledDose != -1 &&
+    !doseActive &&
+    !doseHandled
+  )
+  {
+    // Prevent starting same dose repeatedly
+
+    if (
+      lastFirebaseMinute !=
+      now.minute() ||
+
+      lastFirebaseDay !=
+      now.day()
+    )
+    {
+      lastFirebaseMinute =
+        now.minute();
+
+      lastFirebaseDay =
+        now.day();
+
+
+      startDose(
+        scheduledDose,
+        now
+      );
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // RESET DAILY DOSE LOCK
+  // ---------------------------------------------------
+
+  if (
+    now.minute() !=
+    lastFirebaseMinute &&
+
+    !doseActive
+  )
+  {
+    doseHandled = false;
+    doseMissed = false;
+
+    patientReminderSent = false;
+    caretakerAlertSent = false;
+
+
+    // Return ThingSpeak status to IDLE
+
+    if (
+      thingSpeakDoseStatus == 2 ||
+      thingSpeakDoseStatus == 3
+    )
+    {
+      thingSpeakDoseStatus = 0;
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // CHECK ACTIVE DOSE
+  // ---------------------------------------------------
+
+  checkDoseAccess(now);
+
+
+  // ---------------------------------------------------
+  // MAIN OLED
+  // ---------------------------------------------------
+
+  static unsigned long lastDisplayUpdate = 0;
+
+
+  if (
+    millis() -
+    lastDisplayUpdate >=
+    1000
+  )
+  {
+    lastDisplayUpdate =
+      millis();
+
+
+    if (!doseActive)
+    {
+      showMainScreen(now);
+    }
+  }
+
+
+  delay(10);
 }
